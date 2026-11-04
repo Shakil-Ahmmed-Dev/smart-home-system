@@ -16,14 +16,23 @@
 */
 
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ESP32Servo.h>
 #include <DHT.h>
 
 // ================= CONFIG =================
-const char* WIFI_SSID = "SSH_E_517";
-const char* WIFI_PASS = "66657583";
+// Known Wi-Fi networks (ESP32 will connect to whichever is available)
+WiFiMulti wifiMulti;
+struct WiFiCred {
+  const char* ssid;
+  const char* pass;
+};
+const WiFiCred KNOWN_WIFIS[] = {
+  { "SSH_E_518", "49082623" },
+  { "SSH_E_517", "66657583" },
+};
 
 // ---- Pins ----
 #define PIN_TRIG 5         // HC-SR04 TRIG
@@ -39,8 +48,8 @@ const char* WIFI_PASS = "66657583";
 
 // ---- Water tank (distance from sensor to water surface, in cm) ----
 // Sensor is mounted at the top of the tank, pointing down.
-const float TANK_EMPTY_CM = 12.0;  // distance when the tank is EMPTY
-const float TANK_FULL_CM = 2.0;    // distance when the tank is FULL
+const float TANK_EMPTY_CM = 8.6;   // distance when the tank is EMPTY (calibrated to empty pot)
+const float TANK_FULL_CM = 2.0;    // distance when the tank is FULL (safety margin below lid)
 
 // ---- Door servo angles ----
 const int DOOR_CLOSED_ANGLE = 0;
@@ -48,7 +57,12 @@ const int DOOR_OPEN_ANGLE = 90;
 
 // ---- Logic levels ----
 const bool RELAY_ACTIVE_LOW = true;  // set true if relay turns ON when pin is LOW
-const bool FLAME_ACTIVE_LOW = true;  // most flame modules output LOW when fire detected
+bool flameActiveLow = true;          // true = Active-LOW (DO=1 clear, DO=0 flame detected)
+int rawFlame = 1;                    // raw digital pin reading (1 = clear in active-low)
+bool rawFire = false;                // true while flame is actively detected
+unsigned long lastFireSeenMs = 0;    // timestamp when flame was last detected
+const unsigned long FIRE_HOLD_MS = 5000;  // Hold alert for 5 seconds after flame goes off
+int fireHoldSec = 0;                 // remaining seconds in safety hold window
 // ==========================================
 
 WebServer server(80);
@@ -58,6 +72,8 @@ DHT dht(PIN_DHT, DHT_TYPE);
 bool bulbOn = false;
 bool fanOn = false;
 bool doorOpen = false;
+unsigned long doorOpenMs = 0;
+const unsigned long DOOR_AUTO_CLOSE_MS = 5000;  // Auto-close door after 5 seconds
 bool fireDetected = false;
 
 float tankDistance = -1;  // cm, -1 = invalid
@@ -79,7 +95,12 @@ void applyFan() {
 }
 
 void applyDoor() {
-  doorServo.write(doorOpen ? DOOR_OPEN_ANGLE : DOOR_CLOSED_ANGLE);
+  if (doorOpen) {
+    doorOpenMs = millis();
+  }
+  int angle = doorOpen ? DOOR_OPEN_ANGLE : DOOR_CLOSED_ANGLE;
+  doorServo.write(angle);
+  Serial.printf("[DOOR] %s -> servo angle %d° on GPIO %d\n", doorOpen ? "OPEN" : "CLOSED", angle, PIN_SERVO);
 }
 
 float readDistanceOnce() {
@@ -113,6 +134,32 @@ float readDistanceCm() {
   return v[n / 2];
 }
 
+void checkFlameSensor() {
+  // Multi-sample debounce (5 samples over 1ms) to eliminate RF spikes & wiper noise
+  int highCount = 0;
+  for (int i = 0; i < 5; i++) {
+    if (digitalRead(PIN_FLAME) == HIGH) highCount++;
+    delayMicroseconds(200);
+  }
+  rawFlame = (highCount >= 3) ? HIGH : LOW;
+  rawFire = flameActiveLow ? (rawFlame == LOW) : (rawFlame == HIGH);
+
+  if (rawFire) {
+    lastFireSeenMs = millis();
+    fireDetected = true;
+    fireHoldSec = 5;
+  } else {
+    // Keep alert active for 5 seconds after flame goes off
+    if (lastFireSeenMs > 0 && (millis() - lastFireSeenMs < FIRE_HOLD_MS)) {
+      fireDetected = true;
+      fireHoldSec = (int)((FIRE_HOLD_MS - (millis() - lastFireSeenMs) + 999) / 1000);
+    } else {
+      fireDetected = false;
+      fireHoldSec = 0;
+    }
+  }
+}
+
 void updateSensors() {
   // Tank
   tankDistance = readDistanceCm();
@@ -124,8 +171,7 @@ void updateSensors() {
   }
 
   // Fire
-  int f = digitalRead(PIN_FLAME);
-  fireDetected = FLAME_ACTIVE_LOW ? (f == LOW) : (f == HIGH);
+  checkFlameSensor();
 
   // Temperature / humidity
   float t = dht.readTemperature();
@@ -147,6 +193,10 @@ String stateJson() {
   s += "\"temp\":" + num(tempC) + ",";
   s += "\"hum\":" + num(humidity, 0) + ",";
   s += "\"fire\":" + String(fireDetected ? "true" : "false") + ",";
+  s += "\"fireRaw\":" + String(rawFlame) + ",";
+  s += "\"flamePresent\":" + String(rawFire ? "true" : "false") + ",";
+  s += "\"fireHold\":" + String(fireHoldSec) + ",";
+  s += "\"flameActiveLow\":" + String(flameActiveLow ? "true" : "false") + ",";
   s += "\"door\":" + String(doorOpen ? "true" : "false") + ",";
   s += "\"bulb\":" + String(bulbOn ? "true" : "false") + ",";
   s += "\"fan\":" + String(fanOn ? "true" : "false");
@@ -166,47 +216,49 @@ const char PAGE[] PROGMEM = R"rawliteral(
 <meta name="theme-color" content="#0f1115">
 <title>Home</title>
 <style>
-  :root{--bg:#0f1115;--card:#1a1d24;--text:#f2f3f5;--muted:#8b909a;--accent:#ffc43d;--water:#3d9bff;--ok:#3ddc84;--bad:#ff5d5d}
+  :root{--bg:#090a0e;--card:#13141b;--border:#232532;--text:#f8f9fa;--muted:#9ca1b4;--accent:#ff2d78;--water:#00f0ff;--water2:#0077b6;--ok:#00e676;--bad:#ff2d55}
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;
-       padding:max(18px,env(safe-area-inset-top)) 14px 32px;max-width:520px;margin:auto}
-  h1{font-size:24px;margin:6px 4px 2px}
-  #status{color:var(--muted);font-size:13px;margin:0 4px 14px}
+       padding:max(18px,env(safe-area-inset-top)) 16px 36px;max-width:520px;margin:auto}
+  h1{font-size:24px;margin:6px 4px 2px;font-weight:800;letter-spacing:-0.5px}
+  h1 span{color:var(--accent)}
+  #status{color:var(--muted);font-size:12px;margin:0 4px 16px}
   #status.off{color:var(--bad)}
-  .card{background:var(--card);border-radius:18px;padding:16px;margin-bottom:12px}
-  .card h2{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin:0 0 10px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:20px;padding:18px;margin-bottom:14px}
+  .card h2{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin:0 0 12px}
   .row{display:flex;gap:12px}
-  .row .card{flex:1;margin-bottom:12px}
-  .big{font-size:34px;font-weight:700}
-  .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .row .card{flex:1;margin-bottom:14px}
+  .big{font-size:34px;font-weight:800;letter-spacing:-0.5px}
+  .sub{color:var(--muted);font-size:13px;margin-top:3px}
 
   /* fire */
-  #fire{display:flex;align-items:center;gap:12px}
-  #fire .dot{width:14px;height:14px;border-radius:50%;background:var(--ok)}
-  #fire.alert{background:#4a1616;box-shadow:0 0 0 2px var(--bad);animation:pulse 1s infinite}
-  #fire.alert .dot{background:var(--bad)}
-  @keyframes pulse{50%{opacity:.65}}
+  #fire{display:flex;align-items:center;gap:14px}
+  #fire .dot{width:12px;height:12px;border-radius:50%;background:var(--ok)}
+  #fire.alert{background:#380816;border-color:var(--accent);box-shadow:0 0 20px rgba(255,45,120,.3);animation:pulse 1s infinite}
+  #fire.alert .dot{background:var(--accent)}
+  @keyframes pulse{50%{opacity:.7}}
 
   /* tank */
-  .tankwrap{display:flex;align-items:center;gap:18px}
-  .tank{position:relative;width:84px;height:130px;border:3px solid #3a3f4b;border-radius:10px 10px 18px 18px;overflow:hidden;background:#12151a;flex:none}
-  .water{position:absolute;left:0;right:0;bottom:0;height:0%;background:linear-gradient(var(--water),#2467c4);transition:height .8s}
+  .tankwrap{display:flex;align-items:center;gap:20px}
+  .tank{position:relative;width:76px;height:114px;border:2px solid var(--border);border-radius:8px 8px 16px 16px;overflow:hidden;background:#0c0d12;flex:none}
+  .water{position:absolute;left:0;right:0;bottom:0;height:0%;background:linear-gradient(var(--water),var(--water2));box-shadow:0 0 12px rgba(0,180,216,.4);transition:height .8s}
 
   /* buttons */
-  .btn{width:100%;border:0;border-radius:14px;padding:16px;font-size:16px;font-weight:600;color:var(--text);background:#262a33}
-  .btn:active{transform:scale(.97)}
-  .btn.on{background:#2b2616;box-shadow:0 0 0 1.5px var(--accent),0 0 24px rgba(255,196,61,.25);color:var(--accent)}
-  .btn.open{background:#14301f;box-shadow:0 0 0 1.5px var(--ok);color:var(--ok)}
+  .btn{width:100%;border:1px solid var(--border);border-radius:14px;padding:14px;font-size:15px;font-weight:600;color:var(--text);background:#1a1b24;cursor:pointer}
+  .btn:active{transform:scale(.98)}
+  .btn.on{background:#2a111c;box-shadow:0 0 16px rgba(255,45,120,.25);border-color:var(--accent);color:var(--accent)}
+  .btn.open{background:#122a1b;box-shadow:0 0 16px rgba(0,230,118,.2);border-color:var(--ok);color:var(--ok)}
 </style>
 </head>
 <body>
-<h1>Home</h1>
+<h1>Smart<span>Home</span></h1>
 <p id="status">Connecting…</p>
 
 <div class="card" id="fire">
   <div class="dot"></div>
-  <div><div id="fireTxt" style="font-weight:700;font-size:17px">No fire detected</div>
+  <div style="flex:1"><div id="fireTxt" style="font-weight:700;font-size:17px">No fire detected</div>
        <div class="sub" id="fireSub">Flame sensor OK</div></div>
+  <button class="btn" style="width:auto;padding:8px 12px;font-size:12px;background:#262a33" onclick="invertFlame()">Invert</button>
 </div>
 
 <div class="card">
@@ -226,7 +278,9 @@ const char PAGE[] PROGMEM = R"rawliteral(
 
 <div class="row">
   <div class="card"><h2>Door</h2>
-    <button class="btn" id="doorBtn" onclick="toggleDoor()">--</button></div>
+    <button class="btn" id="doorBtn" onclick="toggleDoor()">--</button>
+    <button class="btn" style="margin-top:6px;padding:8px;font-size:12px;background:#1a1d24" onclick="testDoor()">Test Door</button>
+  </div>
   <div class="card"><h2>Bulb</h2>
     <button class="btn" id="bulbBtn" onclick="toggleBulb()">--</button></div>
   <div class="card">
@@ -252,7 +306,9 @@ function render(){
   const f=$('fire');
   f.classList.toggle('alert',!!S.fire);
   $('fireTxt').textContent=S.fire?'🔥 FIRE DETECTED!':'No fire detected';
-  $('fireSub').textContent=S.fire?'Check immediately':'Flame sensor OK';
+  const pinStr=S.fireRaw===1?'HIGH':'LOW';
+  const modeStr=S.flameActiveLow?'Active-LOW':'Active-HIGH';
+  $('fireSub').textContent=(S.fire?'Check immediately!':'Flame sensor OK')+' • DO pin: '+pinStr+' ('+modeStr+')';
   if(S.fire&&!lastFire&&navigator.vibrate)navigator.vibrate([400,150,400,150,400]);
   lastFire=!!S.fire;
   // door + bulb
@@ -268,6 +324,11 @@ async function api(path){
   }catch(e){$('status').textContent='Disconnected – retrying…';$('status').className='off';}
 }
 function toggleDoor(){S.door=!S.door;render();api('/api/door?open='+(S.door?1:0));}
+function testDoor(){
+  api('/api/door?open=1');
+  setTimeout(()=>api('/api/door?open=0'),2000);
+}
+function invertFlame(){api('/api/flame?invert=1');}
 function toggleBulb(){S.bulb=!S.bulb;render();api('/api/bulb?on='+(S.bulb?1:0));}
 function toggleFan(){S.fan=!S.fan;render();api('/api/fan?on='+(S.fan?1:0));}
 api('/api/state');
@@ -282,6 +343,7 @@ void handleRoot() {
   server.send_P(200, "text/html", PAGE);
 }
 void handleState() {
+  checkFlameSensor();
   server.send(200, "application/json", stateJson());
 }
 
@@ -306,8 +368,85 @@ void handleDoor() {
   if (server.hasArg("open")) {
     doorOpen = server.arg("open").toInt() != 0;
     applyDoor();
+  } else if (server.hasArg("angle")) {
+    int a = server.arg("angle").toInt();
+    doorServo.write(a);
+    Serial.printf("[DOOR] Manual angle: %d°\n", a);
   }
   server.send(200, "application/json", stateJson());
+}
+
+void handleFlame() {
+  if (server.hasArg("invert")) {
+    flameActiveLow = !flameActiveLow;
+    updateSensors();
+    Serial.printf("[FLAME] Inverted logic. flameActiveLow=%s (fireDetected=%s)\n",
+                  flameActiveLow ? "true" : "false", fireDetected ? "YES" : "NO");
+  }
+  server.send(200, "application/json", stateJson());
+}
+
+void handleSerial() {
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.equalsIgnoreCase("open") || cmd.equalsIgnoreCase("door open")) {
+      doorOpen = true;
+      applyDoor();
+    } else if (cmd.equalsIgnoreCase("close") || cmd.equalsIgnoreCase("door close")) {
+      doorOpen = false;
+      applyDoor();
+    } else if (cmd.startsWith("servo ") || cmd.startsWith("angle ")) {
+      int a = cmd.substring(6).toInt();
+      doorServo.write(a);
+      Serial.printf("[DOOR] Servo angle set to %d°\n", a);
+    } else if (cmd.equalsIgnoreCase("invert") || cmd.equalsIgnoreCase("flame invert")) {
+      flameActiveLow = !flameActiveLow;
+      updateSensors();
+      Serial.printf("[FLAME] Inverted logic. flameActiveLow=%s (fireDetected=%s)\n",
+                    flameActiveLow ? "true" : "false", fireDetected ? "YES" : "NO");
+    } else if (cmd.equalsIgnoreCase("test") || cmd.equalsIgnoreCase("door test")) {
+      Serial.println("[DOOR] Testing sweep: Opening (90°)...");
+      doorServo.write(DOOR_OPEN_ANGLE);
+      delay(1500);
+      Serial.println("[DOOR] Closing (0°)...");
+      doorServo.write(DOOR_CLOSED_ANGLE);
+    } else if (cmd.equalsIgnoreCase("bulb on")) {
+      bulbOn = true;
+      applyBulb();
+      Serial.println("[BULB] Relay 1 ON");
+    } else if (cmd.equalsIgnoreCase("bulb off")) {
+      bulbOn = false;
+      applyBulb();
+      Serial.println("[BULB] Relay 1 OFF");
+    } else if (cmd.equalsIgnoreCase("fan on")) {
+      fanOn = true;
+      applyFan();
+      Serial.println("[FAN] Relay 2 ON");
+    } else if (cmd.equalsIgnoreCase("fan off")) {
+      fanOn = false;
+      applyFan();
+      Serial.println("[FAN] Relay 2 OFF");
+    } else if (cmd.equalsIgnoreCase("relay test")) {
+      Serial.println("[RELAY] Testing Relay 1 (Bulb) ON for 2s...");
+      bulbOn = true; applyBulb(); delay(2000);
+      bulbOn = false; applyBulb();
+      Serial.println("[RELAY] Testing Relay 2 (Fan) ON for 2s...");
+      fanOn = true; applyFan(); delay(2000);
+      fanOn = false; applyFan();
+      Serial.println("[RELAY] Test complete.");
+    } else if (cmd.equalsIgnoreCase("status")) {
+      Serial.printf("[STATUS] Fire: %s (Raw DO=%d, Logic=%s) | Door: %s (%d°) | Bulb: %s | Fan: %s\n",
+                    fireDetected ? "ALERT" : "OK", rawFlame,
+                    flameActiveLow ? "Active-LOW" : "Active-HIGH",
+                    doorOpen ? "OPEN" : "CLOSED", doorOpen ? DOOR_OPEN_ANGLE : DOOR_CLOSED_ANGLE,
+                    bulbOn ? "ON" : "OFF", fanOn ? "ON" : "OFF");
+    } else if (cmd.equalsIgnoreCase("ip") || cmd.equalsIgnoreCase("wifi")) {
+      Serial.printf("[WIFI] STA: %s (SSID: %s) | AP: %s\n",
+                    WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "Disconnected",
+                    WiFi.SSID().c_str(), WiFi.softAPIP().toString().c_str());
+    }
+  }
 }
 
 // ---------- setup / loop ----------
@@ -322,41 +461,47 @@ void setup() {
   applyBulb();  // bulb off at start
   applyFan();   // fan off at start
 
+  // Timers allocation for ESP32Servo
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
   dht.begin();
   doorServo.setPeriodHertz(50);
-  doorServo.attach(PIN_SERVO, 500, 2400);
+  doorServo.attach(PIN_SERVO, 544, 2400); // Standard 544us - 2400us range
   applyDoor();  // door closed at start
 
-  // WiFi.mode(WIFI_STA);
-  // WiFi.begin(WIFI_SSID, WIFI_PASS);
-  // delay(5000);
-  // Serial.print("Connecting to Wi-Fi");
-  // unsigned long t0 = millis();
-  // while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-  //   delay(500);
-  //   Serial.print(".");
-  // }
-  // if (WiFi.status() == WL_CONNECTED) {
-  //   Serial.print("\nIP address: ");
-  //   Serial.println(WiFi.localIP());
-  // } else {
-  //   // Fallback hotspot so you can still reach the app
-  //   WiFi.mode(WIFI_AP);
-  //   WiFi.softAP("ESP32-Home", "12345678");
-  //   Serial.print("\nWi-Fi failed. Hotspot 'ESP32-Home' (pw 12345678) at ");
-  //   Serial.println(WiFi.softAPIP());
-  // }
-
-  WiFi.mode(WIFI_AP);
+  // Dual mode: Connect to router WiFi AND keep Hotspot alive simultaneously
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP("ESP32-Home", "12345678");
-  delay(5000);
   Serial.print("\nHotspot 'ESP32-Home' (pw 12345678) at ");
   Serial.println(WiFi.softAPIP());
+
+  Serial.println("Connecting to Wi-Fi...");
+  for (const auto& cred : KNOWN_WIFIS) {
+    wifiMulti.addAP(cred.ssid, cred.pass);
+    Serial.printf("  Added network: %s\n", cred.ssid);
+  }
+
+  unsigned long t0 = millis();
+  while (wifiMulti.run() != WL_CONNECTED && millis() - t0 < 12000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WIFI] Connected to '%s'! Local IP: ", WiFi.SSID().c_str());
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n[WIFI] Router Wi-Fi not connected yet. Hotspot 'ESP32-Home' is active at 192.168.4.1.");
+  }
 
   if (MDNS.begin("esp32-home")) Serial.println("Open http://esp32-home.local");
 
   server.on("/", handleRoot);
   server.on("/api/state", handleState);
+  server.on("/api/flame", handleFlame);
   server.on("/api/bulb", handleBulb);
   server.on("/api/fan", handleFan);
   server.on("/api/door", handleDoor);
@@ -365,12 +510,42 @@ void setup() {
   updateSensors();
 }
 
+unsigned long lastWifiCheck = 0;
+
 void loop() {
   server.handleClient();
+  handleSerial();
 
-  // Read sensors every 2 seconds (the fire sensor is checked each time too)
+  // Hardware auto-close door after 5 seconds
+  if (doorOpen && (millis() - doorOpenMs >= DOOR_AUTO_CLOSE_MS)) {
+    doorOpen = false;
+    applyDoor();
+    Serial.println("[DOOR] Auto-closed after 5 seconds.");
+  }
+
+  // Periodically ensure Wi-Fi stays connected
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiCheck >= 10000) {
+    lastWifiCheck = millis();
+    wifiMulti.run();
+  }
+
+  // Read sensors every 2 seconds
   if (millis() - lastSensorMs >= 2000) {
     lastSensorMs = millis();
     updateSensors();
+    String ipStr = (WiFi.status() == WL_CONNECTED) ? WiFi.localIP().toString() : "No-STA";
+    String fireStr = "OK";
+    if (fireDetected) {
+      if (fireHoldSec > 0 && !((flameActiveLow && rawFlame == LOW) || (!flameActiveLow && rawFlame == HIGH))) {
+        fireStr = "HOLD (" + String(fireHoldSec) + "s)";
+      } else {
+        fireStr = "FIRE ALERT!";
+      }
+    }
+    Serial.printf("[STATUS] IP:%s | Fire: %s (Raw DO=%d) | Door: %s | Temp: %.1fC | Hum: %.0f%% | Tank: %d%% (dist=%.2f cm)\n",
+                  ipStr.c_str(),
+                  fireStr.c_str(), rawFlame,
+                  doorOpen ? "OPEN" : "CLOSED",
+                  tempC, humidity, tankPercent, tankDistance);
   }
 }
